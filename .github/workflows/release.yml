@@ -1,0 +1,237 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (vX.Y.Z). Empty uses the pager crate version."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x86_64
+            bin: xai-grok-pager
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows-x86_64
+            bin: xai-grok-pager.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            raw="${GITHUB_REF_NAME}"
+          elif [ -n "${{ inputs.tag }}" ]; then
+            raw="${{ inputs.tag }}"
+          else
+            raw="$(sed -n 's/^version = "\(.*\)"/\1/p' crates/codegen/xai-grok-pager-bin/Cargo.toml | head -n 1)"
+          fi
+          raw="${raw#v}"
+          if ! printf '%s' "$raw" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9._]+)?$'; then
+            echo "Version must look like X.Y.Z, got: $raw" >&2
+            exit 1
+          fi
+          echo "version=${raw}" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.0"
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.platform }}-release-dist
+          cache-on-failure: "true"
+
+      - name: Linux build packages
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libssl-dev zlib1g-dev cmake unzip
+          curl -fsSL -o /tmp/protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-linux-x86_64.zip
+          sudo unzip -o -d /usr/local/protoc /tmp/protoc.zip
+          echo "PROTOC=/usr/local/protoc/bin/protoc" >> "$GITHUB_ENV"
+          # Hosted runners already swapon /swapfile; fallocate on that path returns ETXTBSY.
+          swap_extra=/mnt/swap-extra
+          avail_kb="$(df -Pk /mnt | awk 'NR==2 {print $4}')"
+          # Keep several GB free for the compiler and the staged binary.
+          extra_kb=$((avail_kb - 8 * 1024 * 1024))
+          if [ "$extra_kb" -lt $((4 * 1024 * 1024)) ]; then
+            echo "Not enough free disk for extra swap (avail_kb=${avail_kb}); using the runner swap only."
+          else
+            extra_gb=$((extra_kb / 1024 / 1024))
+            if [ "$extra_gb" -gt 16 ]; then
+              extra_gb=16
+            fi
+            sudo fallocate -l "${extra_gb}G" "$swap_extra"
+            sudo chmod 600 "$swap_extra"
+            sudo mkswap "$swap_extra"
+            sudo swapon "$swap_extra"
+          fi
+          swapon --show
+          free -h
+
+      - name: Windows protoc and OpenSSL
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dest = Join-Path $env:RUNNER_TEMP 'protoc'
+          $zip = Join-Path $env:RUNNER_TEMP 'protoc.zip'
+          Invoke-WebRequest -Uri 'https://github.com/protocolbuffers/protobuf/releases/download/v29.3/protoc-29.3-win64.zip' -OutFile $zip
+          Expand-Archive -Force $zip -DestinationPath $dest
+          Add-Content $env:GITHUB_ENV "PROTOC=$dest\bin\protoc.exe"
+          $vcpkg = $env:VCPKG_INSTALLATION_ROOT
+          if (-not $vcpkg) { $vcpkg = 'C:\vcpkg' }
+          Add-Content $env:GITHUB_ENV "VCPKG_ROOT=$vcpkg"
+          # Match +crt-static in .cargo/config.toml so libgit2's OpenSSL links into one exe.
+          Add-Content $env:GITHUB_ENV 'VCPKGRS_TRIPLET=x64-windows-static'
+          & "$vcpkg\vcpkg.exe" install 'openssl:x64-windows-static'
+
+      - name: Build
+        shell: bash
+        env:
+          GROK_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          cargo build -p xai-grok-pager-bin --profile release-dist --locked --target "${{ matrix.target }}"
+
+      - name: Stage binary
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          src="target/${{ matrix.target }}/release-dist/${{ matrix.bin }}"
+          "$src" --version
+          mkdir -p dist
+          cp "$src" "dist/grok-${VERSION}-${{ matrix.platform }}"
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            strip --strip-unneeded "dist/grok-${VERSION}-${{ matrix.platform }}"
+            chmod +x "dist/grok-${VERSION}-${{ matrix.platform }}"
+            "dist/grok-${VERSION}-${{ matrix.platform }}" --version
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: grok-${{ matrix.platform }}
+          path: dist/grok-${{ steps.ver.outputs.version }}-${{ matrix.platform }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            raw="${GITHUB_REF_NAME}"
+          elif [ -n "${{ inputs.tag }}" ]; then
+            raw="${{ inputs.tag }}"
+          else
+            raw="$(sed -n 's/^version = "\(.*\)"/\1/p' crates/codegen/xai-grok-pager-bin/Cargo.toml | head -n 1)"
+          fi
+          raw="${raw#v}"
+          echo "version=${raw}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${raw}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums and aliases
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd dist
+          test -f "grok-${VERSION}-linux-x86_64"
+          test -f "grok-${VERSION}-windows-x86_64"
+          cp "grok-${VERSION}-linux-x86_64" grok-linux-x86_64
+          cp "grok-${VERSION}-windows-x86_64" grok-windows-x86_64
+          chmod +x grok-linux-x86_64 "grok-${VERSION}-linux-x86_64"
+          sha256sum grok-* | sort -k2 > SHA256SUMS
+          cp "$GITHUB_WORKSPACE/scripts/install.sh" install.sh
+          cp "$GITHUB_WORKSPACE/scripts/install.ps1" install.ps1
+          cp "$GITHUB_WORKSPACE/scripts/uninstall.sh" uninstall.sh
+          cp "$GITHUB_WORKSPACE/scripts/uninstall.ps1" uninstall.ps1
+
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          set -euo pipefail
+          notes="$(mktemp)"
+          {
+            echo "Linux (including WSL) and Windows x86_64 builds of grok."
+            echo
+            echo '```sh'
+            echo "curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/install.sh | bash"
+            echo '```'
+            echo
+            echo '```powershell'
+            echo "irm https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/install.ps1 | iex"
+            echo '```'
+            echo
+            echo "Pin this release with \`bash -s ${VERSION}\` or \`\$env:GROK_VERSION=\"${VERSION}\"\`."
+            echo
+            echo "Uninstall with uninstall.sh or uninstall.ps1 from this release."
+          } > "$notes"
+          files=(
+            "dist/grok-${VERSION}-linux-x86_64"
+            "dist/grok-${VERSION}-windows-x86_64"
+            dist/grok-linux-x86_64
+            dist/grok-windows-x86_64
+            dist/SHA256SUMS
+            dist/install.sh
+            dist/install.ps1
+            dist/uninstall.sh
+            dist/uninstall.ps1
+          )
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${files[@]}" --clobber
+          else
+            args=(
+              gh release create "$TAG" "${files[@]}"
+              --title "grok ${VERSION}"
+              --notes-file "$notes"
+              --target "$GITHUB_SHA"
+            )
+            case "$VERSION" in
+              *-*) args+=(--prerelease) ;;
+            esac
+            "${args[@]}"
+          fi

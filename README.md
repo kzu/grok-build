@@ -40,16 +40,43 @@ for the version of the code present in this tree.
 
 ## Installing the released binary
 
-Prebuilt binaries are published for macOS, Linux, and Windows:
+This repository publishes Linux (including WSL) and Windows x86_64 builds.
+A tag push (`v*`) or a manual run of the [Release workflow](.github/workflows/release.yml)
+builds `xai-grok-pager` and attaches it, plus the install and uninstall scripts,
+to a GitHub release.
+
+```sh
+curl -fsSL https://github.com/kzu/grok-build/releases/latest/download/install.sh | bash
+grok --version
+```
+
+```powershell
+irm https://github.com/kzu/grok-build/releases/latest/download/install.ps1 | iex
+grok --version
+```
+
+Use the bash installer on Linux and WSL. Use the PowerShell installer on
+Windows. Pin a release with `bash -s 1.0.45` or `$env:GROK_VERSION="1.0.45"`.
+
+```sh
+curl -fsSL https://github.com/kzu/grok-build/releases/latest/download/uninstall.sh | bash
+```
+
+```powershell
+irm https://github.com/kzu/grok-build/releases/latest/download/uninstall.ps1 | iex
+```
+
+The scripts in [`scripts/`](scripts/) are the copies the workflow publishes.
+Upstream SpaceXAI builds, including macOS, stay on
+[x.ai/cli](https://x.ai/cli):
 
 ```sh
 curl -fsSL https://x.ai/cli/install.sh | bash   # macOS / Linux / Git Bash
 irm https://x.ai/cli/install.ps1 | iex          # Windows PowerShell
-grok --version
 ```
 
 See the [changelog](https://x.ai/build/changelog) for the latest fixes,
-features, and improvements in each release.
+features, and improvements in each upstream release.
 
 ## Building from source
 

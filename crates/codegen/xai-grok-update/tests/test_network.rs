@@ -9,8 +9,12 @@
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-use xai_grok_update::auto_update::{download_silent, download_with_progress};
-use xai_grok_update::version::fetch_gcs_version_from_base;
+use xai_grok_update::auto_update::{
+    download_silent, download_verified_github_asset_from_base, download_with_progress,
+};
+use xai_grok_update::version::{
+    fetch_gcs_version_from_base, fetch_github_release_version_from_base,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Happy-path tests (fast, no retries triggered).
@@ -639,4 +643,99 @@ async fn download_silent_parallel_path_reassembles_bytes() {
         !dest.with_extension("tmp").exists(),
         "tmp file must be cleaned up"
     );
+}
+
+#[tokio::test]
+async fn github_latest_release_strips_v_prefix() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/kzu/grok-build/releases/latest"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "tag_name": "v1.2.3"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let version = fetch_github_release_version_from_base(&server.uri(), "kzu/grok-build")
+        .await
+        .unwrap();
+    assert_eq!(version, "1.2.3");
+}
+
+#[tokio::test]
+async fn github_latest_release_rejects_bad_tag() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/kzu/grok-build/releases/latest"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "tag_name": "not-a-version"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let err = fetch_github_release_version_from_base(&server.uri(), "kzu/grok-build")
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("invalid semver"));
+}
+
+#[tokio::test]
+async fn github_asset_download_checks_sha256() {
+    let server = MockServer::start().await;
+    let body = b"hello-grok";
+    let asset = "grok-1.2.3-linux-x86_64";
+    let sums = "d11789362d0c463f412fea221a6fadb757bcebb1bba7440eda4b0b43e66ff238  grok-1.2.3-linux-x86_64\n";
+    Mock::given(method("GET"))
+        .and(path(format!("/releases/download/v1.2.3/{asset}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.as_slice()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/releases/download/v1.2.3/SHA256SUMS"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(sums))
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join(asset);
+    download_verified_github_asset_from_base(
+        &format!("{}/releases/download/v1.2.3", server.uri()),
+        asset,
+        &dest,
+    )
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), body);
+}
+
+#[tokio::test]
+async fn github_asset_download_rejects_checksum_mismatch() {
+    let server = MockServer::start().await;
+    let asset = "grok-1.2.3-linux-x86_64";
+    Mock::given(method("GET"))
+        .and(path(format!("/releases/download/v1.2.3/{asset}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello-grok"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/releases/download/v1.2.3/SHA256SUMS"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(format!("{}  {asset}\n", "0".repeat(64))),
+        )
+        .mount(&server)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join(asset);
+    let err = download_verified_github_asset_from_base(
+        &format!("{}/releases/download/v1.2.3", server.uri()),
+        asset,
+        &dest,
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("checksum mismatch"));
+    assert!(!dest.exists(), "a bad download must not be left in place");
 }

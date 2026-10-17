@@ -31,6 +31,8 @@ pub enum CliUpdateInstaller {
     GhRelease,
     #[serde(rename = "internal")]
     Internal,
+    #[serde(rename = "github")]
+    Github,
     #[serde(rename = "other")]
     Other,
 }
@@ -42,6 +44,7 @@ impl CliUpdateInstaller {
             "npm" => Self::Npm,
             "gh-release" => Self::GhRelease,
             "internal" => Self::Internal,
+            "github" => Self::Github,
             _ => Self::Other,
         }
     }
