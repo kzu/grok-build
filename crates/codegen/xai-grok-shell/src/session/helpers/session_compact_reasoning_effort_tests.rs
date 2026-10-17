@@ -89,6 +89,7 @@ async fn compaction_request_body(
         ApiBackend::ChatCompletions => ("/v1/chat/completions", chat_completions_stream),
         ApiBackend::Responses => ("/v1/responses", responses_stream),
         ApiBackend::Messages => ("/v1/messages", messages_stream),
+        ApiBackend::CursorCli => unreachable!("Cursor CLI compaction sends no HTTP request"),
     };
     let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
     let cap = captured.clone();

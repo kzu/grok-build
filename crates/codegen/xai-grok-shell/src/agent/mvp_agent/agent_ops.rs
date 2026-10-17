@@ -1525,12 +1525,12 @@ impl MvpAgent {
             .filter(|a| a.is_xai_auth())
             .map(|a| a.user_id)
         {
-            self.tier_allowed
-                .set(
-                    super::settings_allow_access(
-                        self.cfg.borrow().remote_settings.as_ref(),
-                    ),
+            let allow = super::settings_allow_access(self.cfg.borrow().remote_settings.as_ref())
+                || crate::agent::cursor_cli::suppress_supergrok_paywalls_cfg(
+                    &self.cfg.borrow(),
+                    Some(self.models_manager.current_model_id().0.as_ref()),
                 );
+            self.tier_allowed.set(allow);
             *self.allow_access_resolved_for.borrow_mut() = Some(identity);
         }
         self.reapply_storage_mode();
@@ -2193,6 +2193,12 @@ impl MvpAgent {
     /// They then short-circuit at call time with the SuperGrok upsell prose (see `ImageGenConfig`/`VideoGenConfig`'s `tier_restricted`).
     /// Fails **open** (returns `false`) whenever we can't positively confirm a restricted personal tier. So this client gate is a UX optimization (a clean in-chat upsell instead of a doomed request), never the security boundary. The only difference is the absent-tier policy (the pager hides on `None`, we fail open on `None`).
     fn is_tier_restricted_capability(&self) -> bool {
+        if crate::agent::cursor_cli::suppress_supergrok_paywalls_cfg(
+            &self.cfg.borrow(),
+            Some(self.models_manager.current_model_id().0.as_ref()),
+        ) {
+            return false;
+        }
         let Some(auth) = self.auth_manager.current() else {
             return false;
         };

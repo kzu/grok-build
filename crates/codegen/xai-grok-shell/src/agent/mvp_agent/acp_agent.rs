@@ -459,6 +459,8 @@ impl acp::Agent for MvpAgent {
             Some(xai_grok_login::PreferredAuthMethod::ApiKey) => false,
             _ => has_cached_token,
         };
+        let has_cursor_cli =
+            crate::agent::cursor_cli::cursor_models_enabled(&self.cfg.borrow());
         let built = {
             let _t = xai_grok_telemetry::instrumentation::timer(
                 "startup.acp_initialize.auth_methods",
@@ -472,6 +474,7 @@ impl acp::Agent for MvpAgent {
                 login_label: login_label.as_deref(),
                 has_auth_provider_command: has_auth_provider,
                 preferred_method,
+                has_cursor_cli,
             })
         };
         let auth_methods = built.methods;
@@ -642,11 +645,15 @@ impl acp::Agent for MvpAgent {
             None,
             Some(serde_json::json!({"method": arguments.method_id.0.as_ref()})),
         );
-        if let Some(preferred) = self.cfg.borrow().grok_com_config.preferred_method {
-            let kind = auth_method::AuthMethodKind::from_id(&arguments.method_id);
+        // Cursor CLI is an orthogonal billing/auth provider — always allowed
+        // alongside a preferred_method pin for xAI methods.
+        let auth_kind = auth_method::AuthMethodKind::from_id(&arguments.method_id);
+        if !matches!(auth_kind, auth_method::AuthMethodKind::CursorCli)
+            && let Some(preferred) = self.cfg.borrow().grok_com_config.preferred_method
+        {
             let allowed = match preferred {
-                xai_grok_login::PreferredAuthMethod::ApiKey => kind.is_api_key(),
-                xai_grok_login::PreferredAuthMethod::Oidc => kind.is_session_based(),
+                xai_grok_login::PreferredAuthMethod::ApiKey => auth_kind.is_api_key(),
+                xai_grok_login::PreferredAuthMethod::Oidc => auth_kind.is_session_based(),
             };
             if !allowed {
                 let msg = match preferred {
@@ -972,6 +979,34 @@ impl acp::Agent for MvpAgent {
                 });
                 self.spawn_post_auth_settings(auth);
                 Ok(self.auth_response_with_meta())
+            }
+            auth_method::CURSOR_CLI_METHOD_ID => {
+                let login_result = tokio::task::spawn_blocking(|| {
+                    crate::agent::cursor_cli::run_agent_login()
+                })
+                .await
+                .map_err(|e| {
+                    emit_login_span(false, "cursor.cli", None, Some("join_error"));
+                    acp::Error::internal_error().data(format!("cursor login task failed: {e}"))
+                })?;
+                if let Err(e) = login_result {
+                    emit_login_span(false, "cursor.cli", None, Some("agent_login_failed"));
+                    return Err(acp::Error::auth_required().data(e));
+                }
+                // Drop the pre-login list-models failure so catalog rebuild
+                // picks up the authenticated Cursor model set.
+                crate::agent::cursor_cli::invalidate_discovery_cache();
+                {
+                    let cfg_snapshot = self.cfg.borrow().clone();
+                    self.models_manager.apply_config(cfg_snapshot);
+                }
+                self.set_auth_method(arguments.method_id.clone());
+                emit_login_span(true, "cursor.cli", None, None);
+                log_event(xai_grok_telemetry::events::Login {
+                    auth_method: "cursor.cli".to_string(),
+                    user_id: None,
+                });
+                Ok(Default::default())
             }
             _ => {
                 Err(

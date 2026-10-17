@@ -22,7 +22,21 @@ impl SessionActor {
         {
             sampling_config.conversation_group_id = Some(id);
         }
-        let model_id = acp::ModelId::new(sampling_config.model.clone());
+        // SamplerConfig.model is the routing slug for Cursor (`auto`); persist
+        // the catalog key (`cursor/auto`) so paywall helpers that key off the
+        // `cursor/` prefix keep working after a model switch.
+        let model_id = if sampling_config.api_backend
+            == xai_grok_sampling_types::ApiBackend::CursorCli
+        {
+            acp::ModelId::new(crate::agent::cursor_cli::catalog_key(
+                crate::agent::cursor_cli::routing_slug(&sampling_config.model),
+            ))
+        } else {
+            acp::ModelId::new(sampling_config.model.clone())
+        };
+        if let Ok(mut slot) = self.cursor_cli_session_id.lock() {
+            *slot = None;
+        }
         let supported = |window: &std::num::NonZeroU64| supported_context_windows.contains(window);
         let selection = match context_window_selection {
             crate::session::SwitchContextWindow::Preserve => {

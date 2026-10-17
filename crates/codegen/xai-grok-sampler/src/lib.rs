@@ -16,6 +16,7 @@ pub mod attribution;
 pub mod client;
 pub mod commands;
 pub mod config;
+pub mod cursor_cli;
 pub mod doom_loop;
 mod doom_loop_recovery;
 pub mod events;
@@ -41,6 +42,10 @@ pub use client::{ApiBackend, SamplingClient, user_agent_string_for};
 pub use config::{
     AuthScheme, BearerResolver, HeaderInjector, OriginClientInfo, RequestCompression, RetryPolicy,
     SamplerConfig, SharedBearerResolver, SharedHeaderInjector,
+};
+pub use cursor_cli::{
+    CURSOR_CLI_API_KEY, CURSOR_CLI_BASE_URL, CursorAccountInfo, CursorCliMode, CursorCliStreamOpts,
+    DiscoveredCursorModel, agent_available, agent_bin, fetch_about, list_models, run_agent_login,
 };
 pub use doom_loop::DoomLoopSignalCollector;
 pub use events::{

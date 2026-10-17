@@ -808,6 +808,8 @@ pub(super) fn dispatch_send_prompt_submission(
     // Tier restricted command upsell
     // A typed invocation would otherwise fall through the unknown-command path below and leak to the model as a raw prompt
     // Upsell instead; genuinely unknown commands still pass through (shell/ACP commands depend on that)
+    // Exception: Cursor-billed routes suppress SuperGrok upsells. A stale deny list (switched to `cursor/…` before tier gates refreshed) is cleared and falls through to normal slash execution
+    // Otherwise submit would silently no-op after the upsell is suppressed
     if !literal
         && trimmed.starts_with('/')
         && let Some(invocation) = crate::slash::parse_invocation(trimmed)
@@ -817,18 +819,23 @@ pub(super) fn dispatch_send_prompt_submission(
             .registry()
             .is_restricted(invocation.token)
     {
-        // Only consume the composer when the upsell can actually open
-        // With another question modal already up, `open_supergrok_upsell` would no-op and wiping the composer here would silently drop the typed text
-        // Keep it instead so the user can resubmit after closing the modal, and never fall through to passthrough for restricted commands
-        if agent.question_view.is_none() {
-            if consume_input {
-                agent.prompt.set_text("");
+        let active_model = agent.session.models.current_model_id_str();
+        if xai_grok_shell::agent::cursor_cli::suppress_supergrok_paywalls(active_model) {
+            agent.set_restricted_commands(&[]);
+        } else {
+            // Only consume the composer when the upsell can actually open
+            // With another question modal already up, `open_supergrok_upsell` would no-op and wiping the composer here would silently drop the typed text
+            // Keep it instead so the user can resubmit after closing the modal, and never fall through to passthrough for restricted commands
+            if agent.question_view.is_none() {
+                if consume_input {
+                    agent.prompt.set_text("");
+                }
+                let opened =
+                    super::billing::open_restricted_command_upsell(agent, login_method_id_from_app);
+                debug_assert!(opened, "no modal was open, so the upsell must open");
             }
-            let opened =
-                super::billing::open_restricted_command_upsell(agent, login_method_id_from_app);
-            debug_assert!(opened, "no modal was open, so the upsell must open");
+            return effects;
         }
-        return effects;
     }
 
     // Registry based slash command execution
