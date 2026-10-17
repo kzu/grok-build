@@ -181,6 +181,7 @@ if mkdir -p "$HOME/.config/fish/completions" 2>/dev/null; then
 fi
 
 config_file="$HOME/.grok/config.toml"
+# Marks this install so `grok update` follows this repo's GitHub releases.
 cli_line='installer = "github"'
 if [ ! -f "$config_file" ]; then
     printf '[cli]\n%s\n' "$cli_line" > "$config_file"

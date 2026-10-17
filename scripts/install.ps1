@@ -141,6 +141,7 @@ try {
 $Config = Join-Path $env:USERPROFILE '.grok\config.toml'
 $GrokHome = Split-Path $Config -Parent
 if (-not (Test-Path $GrokHome)) { New-Item -ItemType Directory -Force -Path $GrokHome | Out-Null }
+# Marks this install so `grok update` follows this repo's GitHub releases.
 $Line = 'installer = "github"'
 if (-not (Test-Path $Config)) {
     Set-Content -Path $Config -Value "[cli]`r`n$Line`r`n" -Encoding ascii

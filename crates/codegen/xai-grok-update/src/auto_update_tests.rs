@@ -205,6 +205,7 @@ fn managed_layout() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBu
 fn test_installer_manages_bin_entrypoints_gate() {
     assert!(installer_manages_bin_entrypoints("internal"));
     assert!(installer_manages_bin_entrypoints("gh-release"));
+    assert!(installer_manages_bin_entrypoints("github"));
     assert!(!installer_manages_bin_entrypoints("npm"));
     assert!(!installer_manages_bin_entrypoints("unknown"));
 }
@@ -940,6 +941,44 @@ fn test_reinstall_hint_gh_release_mentions_gh_command() {
 }
 
 #[test]
+fn test_reinstall_hint_github_uses_fork_installer() {
+    let hint = reinstall_hint("github", "alpha");
+    assert!(
+        hint.contains("kzu/grok-build"),
+        "should name the fork repo: {hint}"
+    );
+    assert!(
+        hint.contains("install.sh") || hint.contains("install.ps1"),
+        "should point at the release installer: {hint}"
+    );
+    assert!(
+        !hint.contains("x.ai/cli"),
+        "fork reinstall must not use the upstream CDN installer: {hint}"
+    );
+}
+
+#[test]
+fn test_configured_channel_github_is_stable() {
+    assert_eq!(configured_channel("github", "alpha"), "stable");
+    assert_eq!(configured_channel("internal", "alpha"), "alpha");
+}
+
+#[test]
+fn test_sha256_for_asset() {
+    let sums = "abc  grok-1.2.3-linux-x86_64\n\
+                def grok-1.2.3-windows-x86_64\n";
+    assert_eq!(
+        sha256_for_asset(sums, "grok-1.2.3-linux-x86_64"),
+        Some("abc")
+    );
+    assert_eq!(
+        sha256_for_asset(sums, "grok-1.2.3-windows-x86_64"),
+        Some("def")
+    );
+    assert_eq!(sha256_for_asset(sums, "missing"), None);
+}
+
+#[test]
 fn test_reinstall_hint_internal_mentions_platform_installer() {
     let hint = reinstall_hint("internal", "stable");
     if cfg!(windows) {
@@ -1396,6 +1435,7 @@ fn test_installer_allows_downgrade_internal() {
 #[test]
 fn test_installer_allows_downgrade_gh_release() {
     assert!(installer_allows_downgrade("gh-release"));
+    assert!(installer_allows_downgrade("github"));
 }
 
 #[test]
@@ -1697,6 +1737,14 @@ fn test_env_installer_explicit_internal() {
     let _g = InstallerEnvGuard::isolate();
     unsafe { std::env::set_var("GROK_INSTALLER", "internal") };
     assert_eq!(env_installer(), Some("internal"));
+}
+
+#[test]
+#[serial_test::serial]
+fn test_env_installer_explicit_github() {
+    let _g = InstallerEnvGuard::isolate();
+    unsafe { std::env::set_var("GROK_INSTALLER", "github") };
+    assert_eq!(env_installer(), Some("github"));
 }
 
 #[test]
