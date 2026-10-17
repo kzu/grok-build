@@ -69,6 +69,8 @@ pub struct AuthMethodsBuildInputs<'a> {
     /// Config pin (`[auth] preferred_method`).
     /// `None` keeps multi-method fallthrough; `Some` is fail-closed (only that method family).
     pub preferred_method: Option<PreferredAuthMethod>,
+    /// Advertise Cursor Agent CLI login when the `agent` binary is available.
+    pub has_cursor_cli: bool,
 }
 
 /// Output of [`build_auth_methods`].
@@ -94,25 +96,44 @@ pub fn build_auth_methods(inputs: AuthMethodsBuildInputs<'_>) -> BuiltAuthMethod
         login_label,
         has_auth_provider_command,
         preferred_method,
+        has_cursor_cli,
     } = inputs;
 
     match preferred_method {
-        Some(PreferredAuthMethod::ApiKey) => build_pinned_api_key(has_external_api_key),
-        Some(PreferredAuthMethod::Oidc) => build_pinned_oidc(
-            has_cached_token,
-            has_enterprise_oidc,
-            enterprise_oidc_issuer,
-            login_label,
-            has_auth_provider_command,
-        ),
-        None => build_unpinned(
-            has_external_api_key,
-            has_cached_token,
-            has_enterprise_oidc,
-            enterprise_oidc_issuer,
-            login_label,
-            has_auth_provider_command,
-        ),
+        Some(PreferredAuthMethod::ApiKey) => {
+            let mut built = build_pinned_api_key(has_external_api_key);
+            maybe_push_cursor_cli(&mut built.methods, has_cursor_cli);
+            built
+        }
+        Some(PreferredAuthMethod::Oidc) => {
+            let mut built = build_pinned_oidc(
+                has_cached_token,
+                has_enterprise_oidc,
+                enterprise_oidc_issuer,
+                login_label,
+                has_auth_provider_command,
+            );
+            maybe_push_cursor_cli(&mut built.methods, has_cursor_cli);
+            built
+        }
+        None => {
+            let mut built = build_unpinned(
+                has_external_api_key,
+                has_cached_token,
+                has_enterprise_oidc,
+                enterprise_oidc_issuer,
+                login_label,
+                has_auth_provider_command,
+            );
+            maybe_push_cursor_cli(&mut built.methods, has_cursor_cli);
+            built
+        }
+    }
+}
+
+fn maybe_push_cursor_cli(methods: &mut Vec<acp::AuthMethod>, has_cursor_cli: bool) {
+    if has_cursor_cli {
+        methods.push(cursor_cli_auth_method());
     }
 }
 
@@ -236,6 +257,7 @@ pub enum AuthMethodKind {
     CachedToken,
     GrokCom,
     Oidc,
+    CursorCli,
     Unknown,
 }
 
@@ -246,6 +268,7 @@ impl AuthMethodKind {
             CACHED_TOKEN_AUTH_METHOD_ID => Self::CachedToken,
             GROK_COM_METHOD_ID => Self::GrokCom,
             OIDC_METHOD_ID => Self::Oidc,
+            CURSOR_CLI_METHOD_ID => Self::CursorCli,
             _ => Self::Unknown,
         }
     }
@@ -262,7 +285,17 @@ impl AuthMethodKind {
 
     /// Requires user interaction (browser, OIDC redirect, or external auth command).
     pub fn needs_interactive_login(self) -> bool {
-        matches!(self, Self::GrokCom | Self::Oidc)
+        matches!(self, Self::GrokCom | Self::Oidc | Self::CursorCli)
+    }
+
+    pub fn auth_error_message(self) -> &'static str {
+        if self.is_session_based() {
+            AUTH_ERROR_SESSION_EXPIRED
+        } else if matches!(self, Self::CursorCli) {
+            AUTH_ERROR_CURSOR_CLI
+        } else {
+            AUTH_ERROR_API_KEY
+        }
     }
 }
 
@@ -302,6 +335,32 @@ pub const AUTH_ERROR_SESSION_EXPIRED: &str =
     "Session expired. Run `grok login` to re-authenticate.";
 
 pub const AUTH_ERROR_API_KEY: &str = "Authentication failed. Run `grok login`, set XAI_API_KEY, or add api_key to ~/.grok/config.toml.";
+
+pub const AUTH_ERROR_CURSOR_CLI: &str =
+    "Cursor authentication failed. Run `/login cursor` (or `agent login`), or set CURSOR_API_KEY.";
+
+pub const CURSOR_CLI_METHOD_ID: &str = "cursor.cli";
+
+/// Cursor Agent CLI subscription login (`agent login` / `CURSOR_API_KEY`).
+///
+/// Do **not** set `external_provider`: that flag means enterprise
+/// `auth_provider_command` auth and hides `/usage` / grok.com billing for the
+/// whole install. Cursor is an additive inference route (`cursor_cli` meta)
+/// and must not trip that gate.
+pub fn cursor_cli_auth_method() -> acp::AuthMethod {
+    let mut meta = acp::Meta::new();
+    meta.insert("cursor_cli".to_owned(), serde_json::json!(true));
+    acp::AuthMethod::Agent(
+        acp::AuthMethodAgent::new(
+            acp::AuthMethodId::new(CURSOR_CLI_METHOD_ID),
+            "Cursor".to_string(),
+        )
+        .description(Some(
+            "Sign in with your Cursor subscription (agent login)".to_string(),
+        ))
+        .meta(Some(meta)),
+    )
+}
 
 /// Next ACP method id when `cached_token` cannot proceed (missing / expired / legacy WebLogin), or `None` when fallthrough is forbidden.
 /// Unpinned: prefer non-interactive `xai.api_key` when advertiseable, else interactive `grok.com`. Pinned `oidc`: **no** fallthrough to api_key; return `None` so the caller fails auth.
@@ -469,6 +528,7 @@ mod tests {
             login_label: None,
             has_auth_provider_command: false,
             preferred_method: None,
+            has_cursor_cli: false,
         }
     }
 
@@ -993,6 +1053,45 @@ mod tests {
         });
         assert_eq!(method_ids(&built), vec![XAI_API_KEY_METHOD_ID]);
         assert_eq!(default_id(&built), Some(XAI_API_KEY_METHOD_ID));
+    }
+
+    #[test]
+    fn cursor_cli_appended_when_enabled() {
+        let built = build_auth_methods(AuthMethodsBuildInputs {
+            has_cursor_cli: true,
+            ..default_inputs()
+        });
+        assert!(
+            built
+                .methods
+                .iter()
+                .any(|m| AuthMethodKind::from_id(m.id()) == AuthMethodKind::CursorCli),
+            "has_cursor_cli must advertise cursor.cli for `/login cursor`",
+        );
+        assert_eq!(
+            built
+                .methods
+                .last()
+                .map(|m| AuthMethodKind::from_id(m.id())),
+            Some(AuthMethodKind::CursorCli),
+            "cursor.cli is additive and must not become the first method",
+        );
+    }
+
+    #[test]
+    fn cursor_cli_auth_method_is_not_external_provider() {
+        let method = cursor_cli_auth_method();
+        let meta = method.meta().expect("cursor.cli must carry meta");
+        assert_eq!(
+            meta.get("cursor_cli").and_then(|v| v.as_bool()),
+            Some(true),
+            "cursor_cli meta marks the Cursor route",
+        );
+        assert_ne!(
+            meta.get("external_provider").and_then(|v| v.as_bool()),
+            Some(true),
+            "external_provider would hide /usage for every Cursor-enabled install",
+        );
     }
 
     #[test]

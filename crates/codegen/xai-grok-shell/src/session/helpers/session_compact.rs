@@ -10,6 +10,7 @@ use async_openai::types::responses::ResponseStreamEvent;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use xai_grok_sampler::SamplerConfig as SamplingConfig;
+use xai_grok_sampler::cursor_cli::{CursorCliCollectError, collect_cursor_cli_summary};
 
 // Re-export compaction utilities from xai-chat-state so existing callers that import from this module continue to work
 pub use xai_chat_state::compaction_utils::{
@@ -289,6 +290,7 @@ If the prior conversation contains a note about files at /tmp/compaction/segment
 /// Output of a successful `generate_session_compact`: the summary plus the streaming signals the caller records onto the compaction span.
 /// `truncated` is derived from the backend's typed stop reason; `stop_reason` is kept as the raw provider string for drill-down.
 /// Latency is captured online (no per-token buffer); fleet percentiles are computed at query time.
+#[derive(Debug)]
 pub(crate) struct CompactOutput {
     pub content: String,
     pub stop_reason: Option<String>,
@@ -425,6 +427,35 @@ where
 #[cfg(test)]
 #[path = "session_compact_compact_cancel_await_tests.rs"]
 mod compact_cancel_await_tests;
+
+fn cursor_cli_message_is_overflow(message: &str) -> bool {
+    is_context_length_error(message) || message.to_ascii_lowercase().contains("payload too large")
+}
+
+fn cursor_cli_compact_error(message: &str) -> acp::Error {
+    acp::Error::internal_error().data(format!("{COMPACT_FAILED_PREFIX}{message}"))
+}
+
+fn map_cursor_cli_compact_error(err: CursorCliCollectError) -> CompactFailure {
+    match err {
+        CursorCliCollectError::Cancelled => CompactFailure::Cancelled,
+        CursorCliCollectError::Auth(message) => {
+            CompactFailure::Deterministic(cursor_cli_compact_error(&message))
+        }
+        CursorCliCollectError::Failed(message) if cursor_cli_message_is_overflow(&message) => {
+            CompactFailure::Overflow(cursor_cli_compact_error(&message))
+        }
+        CursorCliCollectError::Empty(message) if cursor_cli_message_is_overflow(&message) => {
+            CompactFailure::Overflow(cursor_cli_compact_error(&message))
+        }
+        CursorCliCollectError::Timeout(message)
+        | CursorCliCollectError::Spawn(message)
+        | CursorCliCollectError::Failed(message)
+        | CursorCliCollectError::Empty(message) => {
+            CompactFailure::Transient(cursor_cli_compact_error(&message))
+        }
+    }
+}
 
 /// `chat_history` must already include the summarization prompt as its final user message.
 /// The split lets callers persist the exact request payload before issuing it.
@@ -801,6 +832,30 @@ pub(crate) async fn generate_session_compact(
                 itl_max_ms: timing.itl_max_ms(),
             }
         }
+        ApiBackend::CursorCli => {
+            // One-shot ask-mode summary. No `--resume` and no session-id write:
+            // the next user turn starts a fresh agent process from Grok's history.
+            let collected = collect_cursor_cli_summary(
+                &chat_history,
+                sampling_config.model.as_str(),
+                sampling_config.cursor_cli_workspace.as_deref(),
+                idle_timeout,
+                wall_clock_budget_secs,
+                cancel,
+                sampling_config.cursor_cli_compact_fixture.clone(),
+            )
+            .await
+            .map_err(map_cursor_cli_compact_error)?;
+            CompactOutput {
+                content: collected.content,
+                stop_reason: Some("stop".to_string()),
+                truncated: false,
+                ttft_ms: collected.ttft_ms,
+                stream_ms: collected.stream_ms,
+                delta_count: collected.delta_count,
+                itl_max_ms: collected.itl_max_ms,
+            }
+        }
     };
 
     if output.content.is_empty() {
@@ -840,7 +895,7 @@ mod large_body_tests;
 #[path = "session_compact_reasoning_compaction_regression_tests.rs"]
 mod reasoning_compaction_regression_tests;
 
-/// Regression: every backend's compaction request carries the session reasoning effort, and omits it when unset.
+/// Regression: every HTTP backend's compaction request carries the session reasoning effort, and omits it when unset.
 #[cfg(test)]
 #[path = "session_compact_reasoning_effort_tests.rs"]
 mod reasoning_effort_tests;

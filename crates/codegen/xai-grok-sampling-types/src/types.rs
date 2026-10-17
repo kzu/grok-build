@@ -1109,11 +1109,17 @@ pub enum ApiBackend {
     Responses,
     /// Use the Anthropic Messages API (/v1/messages)
     Messages,
+    /// Route prompts through the Cursor Agent CLI (`agent`).
+    /// Mode follows the session (agent / ask / plan); Grok still owns tools.
+    /// Grok keeps client-side tools; Cursor supplies the model via your
+    /// Cursor subscription (`agent login` / `CURSOR_API_KEY`).
+    CursorCli,
 }
 
 impl ApiBackend {
     /// Whether the backend enforces a response JSON schema natively alongside tool calls.
     /// The Messages API does not (a schema there blocks tool use), so structured output there goes through the StructuredOutput tool.
+    /// Cursor CLI is prompt-mediated and does not support native schemas.
     pub fn supports_native_schema(&self) -> bool {
         matches!(self, Self::ChatCompletions | Self::Responses)
     }
@@ -1129,7 +1135,9 @@ impl ApiBackend {
     /// The xAI inference proxy rejects bodies over 50 MiB (nginx `proxy-body-size`); Messages API hosts reject bodies over 30 MB.
     pub const fn default_max_request_bytes(&self) -> NonZeroU64 {
         match self {
-            Self::ChatCompletions | Self::Responses => NonZeroU64::new(50 * 1024 * 1024).unwrap(),
+            Self::ChatCompletions | Self::Responses | Self::CursorCli => {
+                NonZeroU64::new(50 * 1024 * 1024).unwrap()
+            }
             Self::Messages => NonZeroU64::new(30_000_000).unwrap(),
         }
     }

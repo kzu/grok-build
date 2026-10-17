@@ -10,6 +10,7 @@ use serde_json::json;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+use xai_grok_sampler::cursor_cli::CursorCliCompactFixture;
 use xai_grok_sampling_types::ReasoningEffort;
 
 const SUMMARY: &str = "<summary>ok</summary>";
@@ -89,6 +90,9 @@ async fn compaction_request_body(
         ApiBackend::ChatCompletions => ("/v1/chat/completions", chat_completions_stream),
         ApiBackend::Responses => ("/v1/responses", responses_stream),
         ApiBackend::Messages => ("/v1/messages", messages_stream),
+        ApiBackend::CursorCli => {
+            return cursor_cli_compaction_marker(reasoning_effort).await;
+        }
     };
     let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
     let cap = captured.clone();
@@ -166,6 +170,85 @@ fn absent(body: &serde_json::Value, pointer: &str) -> bool {
     body.pointer(pointer).is_none_or(serde_json::Value::is_null)
 }
 
+fn summary_ndjson() -> String {
+    [
+        json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "<sum"}]}
+        }),
+        json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": SUMMARY}]}
+        }),
+        json!({
+            "type": "result",
+            "result": SUMMARY,
+            "session_id": "sess_do_not_resume"
+        }),
+    ]
+    .into_iter()
+    .map(|value| value.to_string())
+    .collect::<Vec<_>>()
+    .join("\n")
+}
+
+async fn cursor_cli_compact(
+    fixture: CursorCliCompactFixture,
+    reasoning_effort: Option<ReasoningEffort>,
+) -> Result<CompactOutput, CompactFailure> {
+    let config = SamplerConfig {
+        api_key: Some("test-api-key".into()),
+        base_url: "http://127.0.0.1:9/v1".into(),
+        model: "test-model".into(),
+        max_completion_tokens: Some(1000),
+        temperature: Some(0.7),
+        api_backend: ApiBackend::CursorCli,
+        context_window: 256_000,
+        reasoning_effort,
+        cursor_cli_compact_fixture: Some(Arc::new(fixture)),
+        ..Default::default()
+    };
+    let client = Client::new(config.clone()).unwrap();
+    let chat_history = vec![
+        ConversationItem::system("You are a helpful assistant."),
+        ConversationItem::user("<user_query>\nfix the bug\n</user_query>"),
+        ConversationItem::assistant("I fixed it."),
+        ConversationItem::user("Summarize the conversation so far."),
+    ];
+    generate_session_compact(
+        chat_history,
+        0,
+        vec![],
+        vec![],
+        client,
+        acp::SessionId::new("reasoning-effort-test"),
+        &config,
+        std::time::Duration::from_secs(30),
+        0,
+        crate::util::config::CompactionToolChoice::None,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+}
+
+async fn cursor_cli_compaction_marker(
+    reasoning_effort: Option<ReasoningEffort>,
+) -> serde_json::Value {
+    let output = cursor_cli_compact(
+        CursorCliCompactFixture {
+            stdout: summary_ndjson(),
+            stderr: String::new(),
+            success: true,
+        },
+        reasoning_effort,
+    )
+    .await
+    .unwrap_or_else(|err| panic!("cursor cli compaction must succeed: {err:?}"));
+    assert_eq!(output.content, SUMMARY);
+    assert_eq!(output.stop_reason.as_deref(), Some("stop"));
+    json!({ "content": output.content })
+}
+
 #[tokio::test]
 async fn chat_completions_compaction_sends_session_reasoning_effort() {
     let body =
@@ -219,4 +302,48 @@ async fn messages_compaction_omits_unset_reasoning_effort() {
     let body = compaction_request_body(ApiBackend::Messages, None).await;
     assert!(absent(&body, "/output_config/effort"), "{body:#}");
     assert!(absent(&body, "/thinking"), "{body:#}");
+}
+
+#[tokio::test]
+async fn cursor_cli_compaction_collects_fixture_summary() {
+    let body = compaction_request_body(ApiBackend::CursorCli, Some(ReasoningEffort::Xhigh)).await;
+    assert_eq!(body["content"], SUMMARY);
+}
+
+#[tokio::test]
+async fn cursor_cli_compaction_auth_stderr_is_deterministic() {
+    let err = cursor_cli_compact(
+        CursorCliCompactFixture {
+            stdout: String::new(),
+            stderr: "Authentication required. Run agent login".into(),
+            success: true,
+        },
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, CompactFailure::Deterministic(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn cursor_cli_compaction_context_length_is_overflow() {
+    for stderr in [
+        "The prompt is too long for this model",
+        "413 Payload Too Large",
+    ] {
+        let err = cursor_cli_compact(
+            CursorCliCompactFixture {
+                stdout: String::new(),
+                stderr: stderr.into(),
+                success: false,
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, CompactFailure::Overflow(_)),
+            "{stderr}: {err:?}"
+        );
+    }
 }

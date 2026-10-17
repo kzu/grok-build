@@ -45,6 +45,7 @@ async fn newer_junk_does_not_consume_the_cap() {
     assert_eq!(dropped, 40);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn keeps_only_regular_files_inside_the_assets_dir() {
     let assets = tempfile::tempdir().unwrap();

@@ -394,6 +394,10 @@ pub(crate) fn resolve_model_catalog(
         }
     }
 
+    if crate::agent::cursor_cli::cursor_cli_enabled(cfg) {
+        crate::agent::cursor_cli::merge_cursor_models(&mut catalog);
+    }
+
     if let Ok(Some(disabled)) = ModelGlobSet::compile(cfg.models.disabled_models.as_deref()) {
         let before = catalog.len();
         catalog.retain(|key, entry| !disabled.matches(key, &entry.model));

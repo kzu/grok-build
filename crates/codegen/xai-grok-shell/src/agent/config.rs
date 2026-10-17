@@ -4218,6 +4218,11 @@ pub struct Features {
     /// Not read through this struct: the live resolver re-reads the `[features]` key out-of-band from raw TOML in `util::config::resolve::mcp`. Declared so `serde_ignored` does not report it as an unrecognized key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_recursive_config_watch: Option<bool>,
+    /// Discover Cursor Agent CLI models and route them through the Cursor subscription backend so Grok can sample with `cursor/<id>` catalog keys.
+    /// Grok keeps client-side tools while billing to your Cursor subscription. Auth is Cursor-side (`agent login` / `CURSOR_API_KEY`).
+    /// `None` = auto (enable when the `agent` binary is available).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_cli: Option<bool>,
     /// Every remaining `[features]` key, typed.
     /// Private: a registry key must be read through [`Config::feature`], which resolves the other tiers too.
     #[serde(flatten)]
@@ -4727,6 +4732,11 @@ pub(crate) fn sampling_config_for_model(
         compactions_remaining: info.compactions_remaining,
         compaction_at_tokens: info.compaction_at_tokens,
         doom_loop_recovery: None,
+        cursor_cli_mode: xai_grok_sampler::CursorCliMode::default(),
+        cursor_cli_resume: None,
+        cursor_cli_session_slot: None,
+        cursor_cli_workspace: None,
+        cursor_cli_compact_fixture: None,
         header_injector: None,
     }
 }
@@ -4923,6 +4933,12 @@ fn acp_model_meta(info: &ModelInfo) -> serde_json::Map<String, serde_json::Value
     }
     if let Some(notice) = &info.notice {
         map.insert(MODEL_NOTICE_META_KEY.to_owned(), notice.to_meta_value());
+    }
+    if matches!(info.api_backend, ApiBackend::CursorCli) {
+        map.insert(
+            "apiBackend".to_string(),
+            serde_json::Value::String("cursor_cli".to_string()),
+        );
     }
     map
 }

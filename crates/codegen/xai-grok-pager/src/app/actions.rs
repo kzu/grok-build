@@ -635,6 +635,8 @@ pub enum Action {
     SwitchAccount,
     /// User pressed login on the welcome screen.
     Login,
+    /// `/login cursor`: authenticate with the Cursor Agent CLI subscription.
+    LoginCursor,
     /// Cancel an in-progress login that was started from inside a session (`/login` or a 401 re-auth prompt) and return to the previous view.
     /// Distinct from `Quit`: abandoning a mid-session re-auth must not exit the app or lose the open session.
     CancelLogin,
@@ -2212,6 +2214,8 @@ pub enum Effect {
         /// Usage-modal fetch generation; echoed back on the task result.
         nonce: u64,
     },
+    /// Fetch Cursor account/subscription via `agent about` for `/usage`.
+    FetchCursorUsage { agent_id: AgentId },
     /// Re-fetch remote settings to check subscription gate.
     RefreshGate,
     /// Spawn a debounce sleep task for shell suggestions.
@@ -2953,6 +2957,18 @@ pub enum TaskResult {
         session_id: acp::SessionId,
         error: String,
         nonce: u64,
+    },
+    /// `/usage` Cursor account block ready. Chains SuperGrok credits next.
+    CursorUsageComplete {
+        agent_id: AgentId,
+        info: Box<xai_grok_shell::agent::cursor_cli::CursorAccountInfo>,
+    },
+    /// `/usage` Cursor account fetch failed or CLI missing. Still chains credits.
+    CursorUsageFailed {
+        agent_id: AgentId,
+        /// When true, skip the error system line (CLI not installed).
+        silent: bool,
+        error: String,
     },
     /// Feedback submitted successfully (fire-and-forget).
     /// A modal-origin completion only takes the consent parked for its exact submission; anything else is stale and a no-op.
