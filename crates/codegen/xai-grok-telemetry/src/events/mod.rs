@@ -2282,6 +2282,7 @@ mod tests {
             (CliUpdateInstaller::Npm, "npm"),
             (CliUpdateInstaller::GhRelease, "gh-release"),
             (CliUpdateInstaller::Internal, "internal"),
+            (CliUpdateInstaller::Github, "github"),
             (CliUpdateInstaller::Other, "other"),
         ] {
             assert_eq!(serde_json::to_value(installer).unwrap(), wire);

@@ -12,6 +12,8 @@ use xai_grok_shell::util::grok_home::grok_home;
 const TTL_SECONDS_BEFORE_AUTO_UPDATE: Duration = Duration::from_secs(60 * 30);
 const NPM_PACKAGE: &str = "@xai-official/grok";
 pub const GH_RELEASE_REPO: &str = "xai-org-shared/grok-build";
+/// Default GitHub repo for `installer = "github"` (scripts/install.sh). Override with `GROK_GITHUB_REPO`.
+pub const FORK_RELEASE_REPO: &str = "kzu/grok-build";
 
 /// Primary CLI base URL: Cloudflare-fronted x.ai endpoint with edge caching for binaries and origin-respecting no-cache for channel pointers.
 pub(crate) const CLI_BASE_URL_PRIMARY: &str = "https://x.ai/cli";
@@ -361,6 +363,111 @@ async fn fetch_gcs_channel_pointer(channel: &str, base_url: &str) -> Result<Stri
     Err(last_err.unwrap())
 }
 
+/// `GROK_GITHUB_REPO` when it is `owner/name`; otherwise [`FORK_RELEASE_REPO`].
+pub fn fork_github_repo() -> String {
+    match std::env::var("GROK_GITHUB_REPO") {
+        Ok(repo) if is_github_repo(repo.trim()) => repo.trim().to_string(),
+        Ok(repo) if !repo.trim().is_empty() => {
+            tracing::warn!("GROK_GITHUB_REPO ignored: expected owner/name, got {repo:?}");
+            FORK_RELEASE_REPO.to_string()
+        }
+        _ => FORK_RELEASE_REPO.to_string(),
+    }
+}
+
+fn is_github_repo(repo: &str) -> bool {
+    let mut parts = repo.split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(owner), Some(name), None) => {
+            let ok = |s: &str| {
+                !s.is_empty()
+                    && s.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            };
+            ok(owner) && ok(name)
+        }
+        _ => false,
+    }
+}
+
+/// `GROK_GITHUB_API_BASE` when it names a loopback base. Tests point both the release lookup and the asset download here.
+fn github_api_override() -> Option<String> {
+    let base = std::env::var("GROK_GITHUB_API_BASE").ok()?;
+    let base = base.trim().trim_end_matches('/').to_string();
+    if is_loopback_base(&base) {
+        return Some(base);
+    }
+    if !base.is_empty() {
+        tracing::warn!("GROK_GITHUB_API_BASE ignored: only loopback bases are honored");
+    }
+    None
+}
+
+fn github_api_base() -> String {
+    github_api_override().unwrap_or_else(|| "https://api.github.com".to_string())
+}
+
+/// Base URL whose children are `{asset}` and `SHA256SUMS` for `version`.
+pub(crate) fn github_release_download_base(repo: &str, version: &str) -> String {
+    if let Some(base) = github_api_override() {
+        return format!("{base}/releases/download/v{version}");
+    }
+    format!("https://github.com/{repo}/releases/download/v{version}")
+}
+
+#[derive(Deserialize)]
+struct GithubLatestRelease {
+    tag_name: String,
+}
+
+/// Latest non-prerelease tag on `repo`, read from `{api_base}/repos/{repo}/releases/latest`.
+#[doc(hidden)]
+pub async fn fetch_github_release_version_from_base(api_base: &str, repo: &str) -> Result<String> {
+    if !is_github_repo(repo) {
+        anyhow::bail!("invalid GitHub repo '{repo}'");
+    }
+    let url = format!(
+        "{}/repos/{}/releases/latest",
+        api_base.trim_end_matches('/'),
+        repo
+    );
+    let client = xai_grok_extra_ca::build_reqwest_client(|builder| {
+        builder.timeout(Duration::from_secs(15))
+    })?;
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "grok-build")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("GitHub release lookup failed for {url}: {e:#}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "GitHub release lookup failed: HTTP {status} for {url}: {}",
+            body.chars().take(200).collect::<String>().trim()
+        );
+    }
+    let release: GithubLatestRelease = resp
+        .json()
+        .await
+        .map_err(|e| anyhow::anyhow!("GitHub release lookup returned unexpected JSON: {e:#}"))?;
+    let trimmed = release.tag_name.trim();
+    let version = trimmed.strip_prefix('v').unwrap_or(trimmed).to_string();
+    if semver::Version::parse(&version).is_err() {
+        anyhow::bail!(
+            "invalid semver in GitHub release tag: '{}'",
+            release.tag_name
+        );
+    }
+    Ok(version)
+}
+
+pub(crate) async fn fetch_fork_release_version() -> Result<String> {
+    fetch_github_release_version_from_base(&github_api_base(), &fork_github_repo()).await
+}
+
 /// Fetch the latest version for the given installer type without writing the version cache.
 /// Use this when the caller needs to control when the cache is written.
 /// Auto-update, for example, should only cache after a successful install or when no update is needed.
@@ -368,6 +475,8 @@ pub async fn fetch_latest_version(installer: &str, config: &UpdateConfig) -> Res
     match installer {
         "npm" => fetch_npm_version(&config.channel, config.npm_registry.as_deref()).await,
         "gh-release" => fetch_gh_release_version(&config.channel).await,
+        // Fork installs follow this repo's latest GitHub release, not the x.ai channel pointer.
+        "github" => fetch_fork_release_version().await,
         // The WinGet package ships only stable releases, whatever channel is configured.
         crate::winget::WINGET => fetch_gcs_version("stable").await,
         _ => fetch_gcs_version(&config.channel).await,
@@ -410,10 +519,16 @@ pub async fn write_version_cache(version: &str, stable_version: Option<&str>) {
 
 /// Fetch the latest version for the given installer type and cache it. Each installer is fully independent: there is no
 /// cross-installer fallback. `"npm"`: uses `npm view` against the public registry; `"internal"`: reads the channel
-/// pointer from the public GCS bucket; `"gh-release"`: uses `gh release list` against GitHub Releases.
+/// pointer from the public GCS bucket; `"gh-release"`: uses `gh release list` against GitHub Releases; `"github"`:
+/// reads this repo's latest GitHub release over HTTPS.
 pub async fn get_latest_version(installer: &str, config: &UpdateConfig) -> Result<String> {
     let version = fetch_latest_version(installer, config).await?;
-    let stable_ptr = try_fetch_stable_pointer().await;
+    // Fork releases have no x.ai stable pointer. The tag we just resolved is the stable version.
+    let stable_ptr = if installer == "github" {
+        Some(version.clone())
+    } else {
+        try_fetch_stable_pointer().await
+    };
     write_version_cache(&version, stable_ptr.as_deref()).await;
     Ok(version)
 }
@@ -750,5 +865,18 @@ mod tests {
             checked_at: "not-rfc3339".to_string(),
         };
         assert!(!bad.is_fresh(now, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn test_github_repo_shape() {
+        assert!(is_github_repo("kzu/grok-build"));
+        assert!(!is_github_repo("kzu"));
+        assert!(!is_github_repo("kzu/grok-build/extra"));
+        assert!(!is_github_repo("https://github.com/kzu/grok-build"));
+        assert!(!is_github_repo("kzu/grok build"));
+        assert_eq!(
+            github_release_download_base("kzu/grok-build", "1.2.3"),
+            "https://github.com/kzu/grok-build/releases/download/v1.2.3"
+        );
     }
 }

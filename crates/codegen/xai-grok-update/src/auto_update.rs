@@ -70,6 +70,14 @@ fn reinstall_hint(installer: &str, channel: &str) -> String {
     match installer {
         "npm" => "Please reinstall via npm:\n  npm i -g @xai-official/grok".to_string(),
         "gh-release" => "Please reinstall via GitHub Releases:\n  gh release download --repo xai-org-shared/grok-build --pattern 'grok-*' --output grok && chmod +x grok".to_string(),
+        "github" => {
+            let repo = crate::version::fork_github_repo();
+            if cfg!(windows) {
+                format!("Please reinstall via:\n  irm https://github.com/{repo}/releases/latest/download/install.ps1 | iex")
+            } else {
+                format!("Please reinstall via:\n  curl -fsSL https://github.com/{repo}/releases/latest/download/install.sh | bash")
+            }
+        }
         WINGET => format!("Update with WinGet:\n  {UPGRADE_COMMAND}"),
         _ => format!("Please reinstall via:\n  {}", manual_install_cmd(channel)),
     }
@@ -230,8 +238,8 @@ pub async fn check_update_status(update_config: &UpdateConfig) -> UpdateStatus {
     let current_version = get_installed_grok_version();
     let current_config = config::load_config().await;
     let auto_update = current_config.cli.auto_update;
-    // The WinGet package ships only stable releases, whatever channel is configured.
-    let channel = if installer.as_deref() == Some(WINGET) {
+    // WinGet and fork GitHub releases ship only stable releases, whatever channel is configured.
+    let channel = if matches!(installer.as_deref(), Some(WINGET) | Some("github")) {
         "stable".to_owned()
     } else {
         update_config.channel.clone()
@@ -394,7 +402,7 @@ pub async fn auto_update_target(update_config: &UpdateConfig) -> Option<(&'stati
     needs_update(
         &current,
         &target,
-        &update_config.channel,
+        configured_channel(installer, &update_config.channel),
         installer_allows_downgrade(installer),
     )
     .unwrap_or(false)
@@ -443,7 +451,7 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
     if needs_update(
         &effective_current,
         &target,
-        &update_config.channel,
+        configured_channel(installer, &update_config.channel),
         allow_downgrade,
     )
     .unwrap_or(false)
@@ -468,21 +476,46 @@ pub async fn ensure_latest_on_disk(update_config: &UpdateConfig) -> Result<Ensur
     if let Some(disk_now) =
         disk_version_for_installer(installer).or_else(|| outcome.installed.clone())
     {
-        outcome.relaunch_needed =
-            needs_update(&running, &disk_now, &update_config.channel, allow_downgrade)
-                .unwrap_or(false);
+        outcome.relaunch_needed = needs_update(
+            &running,
+            &disk_now,
+            configured_channel(installer, &update_config.channel),
+            allow_downgrade,
+        )
+        .unwrap_or(false);
     }
     Ok(outcome)
 }
 
-/// Disk-version probe gated on the installer actually maintaining the managed `~/.grok/bin/grok` symlink. Only the
-/// internal (install.sh / CDN) and gh-release installers write that symlink. npm manages its own global install, so a
-/// symlink left over from a previous internal install would LIE about the npm install's version.
+/// Disk-version probe gated on the installer actually maintaining the managed `~/.grok/bin/grok` symlink. The
+/// internal (CDN), upstream gh-release, and fork `github` installers write that symlink. npm manages its own global
+/// install, so a symlink left over from a previous managed install would LIE about the npm install's version.
 fn disk_version_for_installer(installer: &str) -> Option<String> {
     match installer {
-        "internal" | "gh-release" => crate::version::installed_on_disk_version(),
+        "internal" | "gh-release" | "github" => crate::version::installed_on_disk_version(),
         _ => None,
     }
+}
+
+/// WinGet and this repo's GitHub releases publish one stable line. A configured alpha/enterprise channel does not
+/// change which artifact they install.
+fn configured_channel<'a>(installer: &str, configured: &'a str) -> &'a str {
+    if installer == "github" || installer == WINGET {
+        "stable"
+    } else {
+        configured
+    }
+}
+
+/// Record a confirmed version. Fork installs store that tag as the stable pointer so the `[stable]` label does not
+/// depend on the x.ai channel file.
+async fn cache_checked_version(installer: &str, version: &str) {
+    let stable = if installer == "github" {
+        Some(version.to_string())
+    } else {
+        try_fetch_stable_pointer().await
+    };
+    write_version_cache(version, stable.as_deref()).await;
 }
 
 fn parse_grok_installer(value: &str) -> Option<&'static str> {
@@ -490,6 +523,7 @@ fn parse_grok_installer(value: &str) -> Option<&'static str> {
         "npm" => Some("npm"),
         "internal" => Some("internal"),
         "gh-release" | "gh" => Some("gh-release"),
+        "github" => Some("github"),
         _ => None,
     }
 }
@@ -533,6 +567,9 @@ pub async fn get_installer() -> Option<&'static str> {
     match cfg.cli.installer.as_deref() {
         Some("npm") => Some("npm"),
         Some("gh-release") => Some("gh-release"),
+        // Fork releases installed by scripts/install.sh. Updates come from this
+        // repo's GitHub releases, not the public x.ai CDN.
+        Some("github") => Some("github"),
         Some(_) => Some("internal"),
         // A wiped config must not reclassify an npm install as internal:
         // that re-enables downgrades and updates npm never sees.
@@ -591,7 +628,7 @@ fn needs_update(current: &str, target: &str, channel: &str, allow_downgrade: boo
 /// installed via `install.sh` are classified as `"internal"` by `get_installer()`, so they also get rollback support.
 fn installer_allows_downgrade(installer: &str) -> bool {
     match installer {
-        "internal" | "gh-release" => true,
+        "internal" | "gh-release" | "github" => true,
         "npm" => false,
         _ => false,
     }
@@ -656,13 +693,12 @@ pub async fn check_update_background(update_config: &UpdateConfig) -> Background
     if !needs_update(
         &current_version,
         &target_version,
-        &update_config.channel,
+        configured_channel(installer, &update_config.channel),
         allow_downgrade,
     )
     .unwrap_or(false)
     {
-        let stable_ptr = try_fetch_stable_pointer().await;
-        write_version_cache(&target_version, stable_ptr.as_deref()).await;
+        cache_checked_version(installer, &target_version).await;
         return BackgroundUpdateCheck::none();
     }
 
@@ -673,7 +709,7 @@ pub async fn check_update_background(update_config: &UpdateConfig) -> Background
         Some(disk) => needs_update(
             &disk,
             &target_version,
-            &update_config.channel,
+            configured_channel(installer, &update_config.channel),
             allow_downgrade,
         )
         .unwrap_or(true),
@@ -757,12 +793,7 @@ pub async fn run_update_if_available(
                 return Ok(false);
             }
         };
-    // The WinGet package ships only stable releases, whatever channel is configured.
-    let channel = if inst == WINGET {
-        "stable"
-    } else {
-        update_config.channel.as_str()
-    };
+    let channel = configured_channel(inst, &update_config.channel);
     if !needs_update(
         &current_version,
         &latest_version,
@@ -771,8 +802,7 @@ pub async fn run_update_if_available(
     )
     .unwrap_or(false)
     {
-        let stable_ptr = try_fetch_stable_pointer().await;
-        write_version_cache(&latest_version, stable_ptr.as_deref()).await;
+        cache_checked_version(inst, &latest_version).await;
         return Ok(false);
     }
     if inst == WINGET {
@@ -790,7 +820,7 @@ pub async fn run_update_if_available(
         return Ok(false);
     }
 
-    let channel_label = format!(" [{}]", update_config.channel);
+    let channel_label = format!(" [{channel}]");
     if auto_update {
         eprintln!(
             "A new version of Grok Build is available: {} -> {}{}",
@@ -976,6 +1006,7 @@ pub async fn run_install_script(
         )
         .map(|()| None),
         "gh-release" => install_gh_release(target).await.map(|()| None),
+        "github" => install_github_release(target).await.map(|()| None),
         WINGET => Err(anyhow::anyhow!("this install is managed by WinGet")),
         _ => install_internal(target, update_config).await.map(Some),
     };
@@ -1319,6 +1350,117 @@ pub async fn download_silent(url: &str, dest: &std::path::Path) -> Result<()> {
     drop(file);
 
     publish_downloaded_artifact(&tmp, dest).await?;
+    Ok(())
+}
+
+/// `SHA256SUMS` line whose second field is `asset`. Hash is the first field (`sha256sum` layout).
+pub(crate) fn sha256_for_asset<'a>(sums: &'a str, asset: &str) -> Option<&'a str> {
+    sums.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let hash = parts.next()?;
+        let name = parts.next()?;
+        (name == asset).then_some(hash)
+    })
+}
+
+fn sha256_file(path: &std::path::Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("open {} for checksum", path.display()))?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher).with_context(|| format!("hash {}", path.display()))?;
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn github_download_client() -> Result<reqwest::Client> {
+    xai_grok_extra_ca::build_reqwest_client(|builder| {
+        builder
+            .timeout(DOWNLOAD_REQUEST_TIMEOUT)
+            .user_agent("grok-build")
+    })
+    .map_err(Into::into)
+}
+
+/// Download `asset_name` from `download_base` and require its `SHA256SUMS` entry to match.
+#[doc(hidden)]
+pub async fn download_verified_github_asset_from_base(
+    download_base: &str,
+    asset_name: &str,
+    dest: &std::path::Path,
+) -> Result<()> {
+    let base = download_base.trim_end_matches('/');
+    let asset_url = format!("{base}/{asset_name}");
+    let sums_url = format!("{base}/SHA256SUMS");
+    let client = github_download_client()?;
+
+    let resp = client
+        .get(&asset_url)
+        .send()
+        .await
+        .with_context(|| format!("download {asset_url}"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("Download failed: HTTP {} for {asset_url}", resp.status());
+    }
+    let tmp = tmp_download_path(dest);
+    let mut file = tokio::fs::File::create(&tmp).await?;
+    let mut stream = resp.bytes_stream();
+    let write_result: Result<()> = async {
+        while let Some(chunk) = stream.next().await {
+            file.write_all(&chunk?).await?;
+        }
+        file.flush().await?;
+        Ok(())
+    }
+    .await;
+    drop(file);
+    if let Err(e) = write_result {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e);
+    }
+    publish_downloaded_artifact(&tmp, dest).await?;
+
+    let sums_resp = match client.get(&sums_url).send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            let _ = tokio::fs::remove_file(dest).await;
+            anyhow::bail!("download {sums_url}: {e:#}");
+        }
+    };
+    if !sums_resp.status().is_success() {
+        let status = sums_resp.status();
+        let _ = tokio::fs::remove_file(dest).await;
+        anyhow::bail!("Download failed: HTTP {status} for {sums_url}");
+    }
+    let sums = match sums_resp.text().await {
+        Ok(text) => text,
+        Err(e) => {
+            let _ = tokio::fs::remove_file(dest).await;
+            anyhow::bail!("read {sums_url}: {e:#}");
+        }
+    };
+    let Some(expected) = sha256_for_asset(&sums, asset_name) else {
+        let _ = tokio::fs::remove_file(dest).await;
+        anyhow::bail!("SHA256SUMS has no entry for {asset_name}");
+    };
+    let expected = expected.to_string();
+    if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
+        let _ = tokio::fs::remove_file(dest).await;
+        anyhow::bail!("SHA256SUMS entry for {asset_name} is not a sha256 hex digest");
+    }
+    let actual = tokio::task::spawn_blocking({
+        let dest = dest.to_path_buf();
+        move || sha256_file(&dest)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("checksum task failed: {e}"))??;
+    if !actual.eq_ignore_ascii_case(&expected) {
+        let _ = tokio::fs::remove_file(dest).await;
+        anyhow::bail!("checksum mismatch for {asset_name}");
+    }
     Ok(())
 }
 
@@ -2174,7 +2316,7 @@ async fn sweep_old_exe_backups(old: &std::path::Path) {
 }
 
 fn installer_manages_bin_entrypoints(installer: &str) -> bool {
-    matches!(installer, "internal" | "gh-release")
+    matches!(installer, "internal" | "gh-release" | "github")
 }
 
 #[cfg_attr(not(any(unix, windows)), allow(clippy::unused_async))]
@@ -2397,6 +2539,76 @@ async fn install_gh_release(target: Option<&str>) -> Result<()> {
         st.cli.installer = Some("gh-release".to_string());
     })
     .await;
+
+    Ok(())
+}
+
+/// Download and install grok from this repo's GitHub Releases. The version is the latest non-prerelease tag.
+/// The asset name and `SHA256SUMS` match `scripts/install.sh` and the release workflow.
+async fn install_github_release(target: Option<&str>) -> Result<()> {
+    let (os, arch) = detect_platform()?;
+    let platform = format!("{os}-{arch}");
+
+    let version = match target {
+        Some(v) => {
+            semver::Version::parse(v)
+                .map_err(|_| anyhow::anyhow!("invalid version format: '{v}'"))?;
+            v.to_string()
+        }
+        None => crate::version::fetch_fork_release_version().await?,
+    };
+
+    let grok_home = grok_home();
+    let download_dir = grok_home.join("downloads");
+    let bin_dir = grok_home.join("bin");
+    tokio::fs::create_dir_all(&download_dir).await?;
+    tokio::fs::create_dir_all(&bin_dir).await?;
+
+    let binary_name = format!("grok-{version}-{platform}");
+    let binary_path = download_dir.join(&binary_name);
+    let repo = crate::version::fork_github_repo();
+    let base = crate::version::github_release_download_base(&repo, &version);
+
+    eprintln!("  Downloading grok v{version} ({platform}) from GitHub Releases...");
+
+    download_verified_github_asset_from_base(&base, &binary_name, &binary_path)
+        .await
+        .map_err(wrap_download_err)?;
+
+    let smoke_result = smoke_test_binary(&binary_path).await;
+    if let Err(fail) = smoke_result {
+        let _ = tokio::fs::remove_file(&binary_path).await;
+        return Err(fail.into());
+    }
+
+    swap_managed_bin_links(&binary_path, &bin_dir).await?;
+
+    #[cfg(unix)]
+    {
+        let latest_path = download_dir.join("grok-latest");
+        let rel_target = relative_symlink_target(&binary_path, &latest_path);
+        if let Err(e) = atomic_symlink_swap(&rel_target, &latest_path).await {
+            tracing::warn!("Failed to update grok-latest symlink: {e}");
+        }
+    }
+
+    #[cfg(unix)]
+    for name in ["grok", "agent"] {
+        let system_link = std::path::PathBuf::from(format!("/usr/local/bin/{name}"));
+        if let Ok(existing_target) = tokio::fs::read_link(&system_link).await {
+            let target_str = existing_target.to_string_lossy();
+            if target_str.contains(".grok/downloads/") && !target_str.ends_with("grok-latest") {
+                let _ = atomic_symlink_swap(&binary_path, &system_link).await;
+            }
+        }
+    }
+
+    remove_stale_pager(&bin_dir).await;
+
+    eprintln!();
+
+    cleanup_old_downloads(&download_dir, "grok", &version).await;
+    cleanup_old_downloads(&download_dir, "grok-pager", &version).await;
 
     Ok(())
 }
@@ -2668,8 +2880,7 @@ pub async fn run_update(
     let (latest_version, install_target) = match plan {
         UpdatePlan::Skip { latest } => {
             // Cache so an explicit `grok update` doesn't re-prompt every run.
-            let stable_ptr = try_fetch_stable_pointer().await;
-            write_version_cache(&latest, stable_ptr.as_deref()).await;
+            cache_checked_version(installer, &latest).await;
             eprintln!("{}", skipped_update_notice(&latest, &current_version));
             refresh_deployment_config().await;
             return Ok(None);
@@ -2696,7 +2907,7 @@ pub async fn run_update(
         match needs_update(
             &effective_current,
             &install_target,
-            &update_config.channel,
+            configured_channel(installer, &update_config.channel),
             installer_allows_downgrade(installer),
         ) {
             Some(true) => {}
@@ -2707,8 +2918,7 @@ pub async fn run_update(
                 if channel_switch.is_some() && effective_current != install_target {
                     // Fall through to install
                 } else {
-                    let stable_ptr = try_fetch_stable_pointer().await;
-                    write_version_cache(&install_target, stable_ptr.as_deref()).await;
+                    cache_checked_version(installer, &install_target).await;
                     eprintln!("Already up to date ({}).", effective_current);
                     // Retry if a prior sync failed.
                     refresh_deployment_config().await;
@@ -2723,13 +2933,11 @@ pub async fn run_update(
                 let parse_ok = semver::Version::parse(&effective_current).is_ok()
                     && semver::Version::parse(&install_target).is_ok();
                 if parse_ok {
+                    let channel = configured_channel(installer, &update_config.channel);
                     anyhow::bail!(
-                        "Unsupported release channel '{}' (current={}, target={}). \
+                        "Unsupported release channel '{channel}' (current={effective_current}, target={install_target}). \
                          Supported channels: stable, alpha, enterprise. \
-                         Use --stable or --alpha to override, or set [cli] channel in config.toml.",
-                        update_config.channel,
-                        effective_current,
-                        install_target
+                         Use --stable or --alpha to override, or set [cli] channel in config.toml."
                     );
                 } else {
                     anyhow::bail!(
@@ -2746,7 +2954,7 @@ pub async fn run_update(
         && !needs_update(
             &effective_current,
             &install_target,
-            &update_config.channel,
+            configured_channel(installer, &update_config.channel),
             installer_allows_downgrade(installer),
         )
         .unwrap_or(true)
@@ -2764,9 +2972,9 @@ pub async fn run_update(
     eprintln!();
     run_install_script(installer, Some(target_version), update_config, trigger).await?;
     // Fetch the stable pointer now so the new binary has it immediately for channel_label() display
-    // Otherwise it would wait for the next TTL-gated update check (~30 min)
-    let stable_ptr = try_fetch_stable_pointer().await;
-    write_version_cache(target_version, stable_ptr.as_deref()).await;
+    // Otherwise it would wait for the next TTL-gated update check (~30 min).
+    // Fork installs record the GitHub tag itself and do not call the x.ai pointer.
+    cache_checked_version(installer, target_version).await;
     refresh_deployment_config().await;
     eprintln!("  ✓ grok v{} installed successfully!", target_version);
 
