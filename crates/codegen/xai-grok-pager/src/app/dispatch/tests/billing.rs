@@ -729,6 +729,13 @@ fn is_session_usage_fetch(effects: &[Effect]) -> bool {
     )
 }
 
+fn is_cursor_usage_fetch(effects: &[Effect]) -> bool {
+    matches!(
+        effects,
+        [Effect::FetchCursorUsage { agent_id }] if *agent_id == AgentId(0)
+    )
+}
+
 fn is_nonsilent_billing(effects: &[Effect]) -> bool {
     matches!(
         effects,
@@ -764,6 +771,30 @@ fn fail_session_usage(app: &mut AppView, session_id: &str, error: &str) -> Vec<E
     )
 }
 
+fn complete_cursor_usage(
+    app: &mut AppView,
+    info: xai_grok_shell::agent::cursor_cli::CursorAccountInfo,
+) -> Vec<Effect> {
+    dispatch(
+        Action::TaskComplete(TaskResult::CursorUsageComplete {
+            agent_id: AgentId(0),
+            info: Box::new(info),
+        }),
+        app,
+    )
+}
+
+fn fail_cursor_usage(app: &mut AppView, silent: bool, error: &str) -> Vec<Effect> {
+    dispatch(
+        Action::TaskComplete(TaskResult::CursorUsageFailed {
+            agent_id: AgentId(0),
+            silent,
+            error: error.into(),
+        }),
+        app,
+    )
+}
+
 #[test]
 fn show_usage_schedules_session_fetch_only() {
     let mut app = test_app_with_agent();
@@ -790,7 +821,10 @@ fn show_usage_without_session_still_surfaces_credits() {
     let effects = dispatch(Action::ShowUsage, &mut app);
     assert!(last_system_text(&app, AgentId(0)).contains("unavailable"));
     assert_eq!(agent_scrollback_len(&app), before + 1);
-    assert!(is_nonsilent_billing(&effects));
+    // Cursor account fetch is chained before SuperGrok credits.
+    assert!(is_cursor_usage_fetch(&effects));
+    let billing = fail_cursor_usage(&mut app, true, "not found");
+    assert!(is_nonsilent_billing(&billing));
 }
 
 #[test]
@@ -853,7 +887,19 @@ fn session_usage_complete_pushes_block_and_chains_billing() {
         text.contains("Session usage") && text.contains("$0.5000"),
         "{text}"
     );
-    assert!(is_nonsilent_billing(&effects));
+    assert!(is_cursor_usage_fetch(&effects));
+    let billing = complete_cursor_usage(
+        &mut app,
+        xai_grok_shell::agent::cursor_cli::CursorAccountInfo {
+            subscription_tier: Some("pro".into()),
+            user_email: Some("u@example.com".into()),
+            cli_version: Some("1.0.0".into()),
+            model: None,
+        },
+    );
+    assert_eq!(agent_scrollback_len(&app), before + 2);
+    assert!(last_system_text(&app, AgentId(0)).contains("Cursor usage"));
+    assert!(is_nonsilent_billing(&billing));
 }
 
 #[test]
@@ -863,8 +909,11 @@ fn session_usage_complete_no_billing_when_surface_hidden() {
     app.usage_visible = false;
     let before = agent_scrollback_len(&app);
     let effects = complete_session_usage(&mut app, "test-session", Default::default());
-    assert!(effects.is_empty());
-    // Only the credit follow-up is gated; the session block itself must land.
+    // Cursor fetch still runs; billing is gated after Cursor completes.
+    assert!(is_cursor_usage_fetch(&effects));
+    assert_eq!(agent_scrollback_len(&app), before + 1);
+    let billing = fail_cursor_usage(&mut app, true, "not found");
+    assert!(billing.is_empty());
     assert_eq!(agent_scrollback_len(&app), before + 1);
 }
 
@@ -873,7 +922,7 @@ fn session_usage_complete_redirect_after_session_block() {
     let mut app = test_app_with_agent();
     app.screen_mode = crate::app::ScreenMode::Minimal;
     app.usage_billing_redirect_url = Some("https://billing.example.com/me".into());
-    // Dispatch defers the redirect until after the session block.
+    // Dispatch defers the redirect until after the session + Cursor blocks.
     let before = agent_scrollback_len(&app);
     assert!(is_session_usage_fetch(&dispatch(
         Action::ShowUsage,
@@ -882,7 +931,10 @@ fn session_usage_complete_redirect_after_session_block() {
     assert_eq!(agent_scrollback_len(&app), before);
 
     let effects = complete_session_usage(&mut app, "test-session", Default::default());
-    assert!(effects.is_empty());
+    assert!(is_cursor_usage_fetch(&effects));
+    assert_eq!(agent_scrollback_len(&app), before + 1);
+    let redirect = fail_cursor_usage(&mut app, true, "not found");
+    assert!(redirect.is_empty());
     assert_eq!(agent_scrollback_len(&app), before + 2);
     assert!(last_system_text(&app, AgentId(0)).contains("https://billing.example.com/me"));
 }
@@ -915,7 +967,9 @@ fn session_usage_failed_pushes_error_and_chains_billing() {
     let effects = fail_session_usage(&mut app, "test-session", "boom");
     assert_eq!(agent_scrollback_len(&app), before + 1);
     assert!(last_system_text(&app, AgentId(0)).contains("Couldn't load session usage: boom"));
-    assert!(is_nonsilent_billing(&effects));
+    assert!(is_cursor_usage_fetch(&effects));
+    let billing = fail_cursor_usage(&mut app, true, "not found");
+    assert!(is_nonsilent_billing(&billing));
 }
 
 #[test]
@@ -1457,6 +1511,44 @@ fn restricted_command_alias_also_upsells() {
     assert!(
         test_agent(&app, id).question_view.is_some(),
         "upsell must open"
+    );
+}
+
+/// Stale Free-tier deny list + Cursor-billed model must not silent-no-op:
+/// upsell is suppressed, so `/usage` must execute (FetchSessionUsage).
+#[test]
+fn restricted_usage_on_cursor_model_executes_instead_of_silent_noop() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let cursor = acp::ModelId::new(std::sync::Arc::from("cursor/auto"));
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.models.available.insert(
+            cursor.clone(),
+            acp::ModelInfo::new(cursor.clone(), "Cursor Auto".to_string()),
+        );
+        agent.session.models.set_current(cursor, None);
+        agent.session.session_id = Some(acp::SessionId::new(std::sync::Arc::from("s1")));
+        agent.set_restricted_commands(&["usage".to_string()]);
+    }
+
+    let effects = dispatch(Action::SendPrompt("/usage".into()), &mut app);
+
+    assert!(
+        app.agents[&id].question_view.is_none(),
+        "Cursor route must not open SuperGrok upsell"
+    );
+    assert!(
+        effects.iter().any(|e| matches!(e, Effect::FetchSessionUsage { .. })),
+        "expected FetchSessionUsage, got {effects:?}"
+    );
+    assert!(
+        !app.agents[&id]
+            .prompt
+            .slash_controller
+            .registry()
+            .is_restricted("usage"),
+        "stale deny list must be cleared so dispatch can run"
     );
 }
 

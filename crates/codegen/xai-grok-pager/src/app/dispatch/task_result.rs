@@ -43,9 +43,9 @@ use super::session::modal::remove_agent_and_cleanup;
 use super::session::picker_routing::PickerRequest;
 use super::settings::ui::{apply_setting_rollback, refresh_open_settings_modals};
 use super::status::{
-    handle_coding_data_sharing_failed, handle_coding_data_sharing_updated,
-    handle_context_info_complete, handle_session_usage_result, toast_persist_failure,
-    usage_modal_state_mut,
+    commit_cursor_usage_block, handle_coding_data_sharing_failed,
+    handle_coding_data_sharing_updated, handle_context_info_complete, handle_session_usage_result,
+    toast_persist_failure, usage_modal_state_mut,
 };
 use super::transcript::{
     handle_hooks_list_loaded, handle_marketplace_list_loaded, handle_marketplace_updates_available,
@@ -1688,6 +1688,24 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             &session_id,
             format!("Couldn't load session usage: {error}"),
             nonce,
+        ),
+        TaskResult::CursorUsageComplete { agent_id, info } => commit_cursor_usage_block(
+            app,
+            agent_id,
+            Some(crate::app::status_blocks::cursor_usage_block_text(&info)),
+        ),
+        TaskResult::CursorUsageFailed {
+            agent_id,
+            silent,
+            error,
+        } => commit_cursor_usage_block(
+            app,
+            agent_id,
+            if silent {
+                None
+            } else {
+                Some(format!("Couldn't load Cursor usage: {error}"))
+            },
         ),
         TaskResult::FeedbackComplete {
             agent_id,

@@ -124,6 +124,7 @@ impl AppView {
     /// Chokepoint for showing a gate.
     /// An already-gated view just updates the copy.
     /// A consumer session with access defers for live verification (the gate source may be stale).
+    /// Cursor-billed routes still store the gate: [`AppView::has_access`] suppresses the UI while on a Cursor model (or explicit override), so switching back to an xAI free-tier model restores the paywall.
     #[must_use]
     pub fn impose_gate(&mut self, gate: xai_grok_login::GateInfo) -> Vec<Effect> {
         if self.gate.is_some() {

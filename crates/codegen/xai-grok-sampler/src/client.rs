@@ -321,6 +321,12 @@ pub struct SamplingClient {
     /// Endpoint URL builder, resolved once from `base_url` and `query_params`.
     endpoint: EndpointTemplate,
     first_use_noted: Arc<AtomicBool>,
+    /// Cursor CLI `--resume` session id for the next ask-mode turn.
+    cursor_cli_resume: Option<String>,
+    /// Shared slot written with the Cursor CLI session id after success.
+    cursor_cli_session_slot: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
+    /// Project cwd for Cursor CLI `--workspace`.
+    cursor_cli_workspace: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for SamplingClient {
@@ -350,6 +356,7 @@ struct ClientDefaults {
     reasoning_summary: Option<xai_grok_sampling_types::ReasoningSummary>,
     extra_response_includes: Vec<String>,
     doom_loop_recovery: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
+    cursor_cli_mode: crate::cursor_cli::CursorCliMode,
 }
 
 /// Endpoint URL builder, resolved once at client construction so each request only appends its path.
@@ -657,6 +664,7 @@ impl SamplingClient {
             reasoning_summary: config.reasoning_summary,
             extra_response_includes: config.extra_response_includes,
             doom_loop_recovery: config.doom_loop_recovery,
+            cursor_cli_mode: config.cursor_cli_mode,
         };
 
         let endpoint = EndpointTemplate::new(&config.base_url, &config.query_params);
@@ -671,11 +679,36 @@ impl SamplingClient {
             header_injector: config.header_injector,
             endpoint,
             first_use_noted: Arc::new(AtomicBool::new(false)),
+            cursor_cli_resume: config.cursor_cli_resume,
+            cursor_cli_session_slot: config.cursor_cli_session_slot,
+            cursor_cli_workspace: config.cursor_cli_workspace,
         })
     }
 
     pub fn api_backend(&self) -> ApiBackend {
         self.defaults.api_backend.clone()
+    }
+
+    /// The configured model slug for this client.
+    pub fn model(&self) -> &str {
+        &self.defaults.model
+    }
+
+    /// Cursor CLI mode for [`ApiBackend::CursorCli`] turns.
+    ///
+    /// Deprecated for sampling: the backend always uses `--mode ask`. Kept so
+    /// callers that still read this field compile.
+    pub fn cursor_cli_mode(&self) -> crate::cursor_cli::CursorCliMode {
+        self.defaults.cursor_cli_mode
+    }
+
+    /// Options for the next Cursor CLI sampling turn (resume + session slot).
+    pub fn cursor_cli_stream_opts(&self) -> crate::cursor_cli::CursorCliStreamOpts {
+        crate::cursor_cli::CursorCliStreamOpts {
+            resume: self.cursor_cli_resume.clone(),
+            session_slot: self.cursor_cli_session_slot.clone(),
+            workspace: self.cursor_cli_workspace.clone(),
+        }
     }
 
     /// Give the bearer resolver its pre-send hook before [`Self::post`] reads it.
@@ -2183,6 +2216,20 @@ impl SamplingClient {
                 let events = crate::stream::stream_messages(raw, meta, request_id, idle_timeout);
                 crate::stream::collect_response(events).await
             }
+            ApiBackend::CursorCli => {
+                let model = self.model().to_owned();
+                let opts = self.cursor_cli_stream_opts();
+                let cancel = tokio_util::sync::CancellationToken::new();
+                let events = crate::cursor_cli::stream_cursor_cli(
+                    request,
+                    model,
+                    request_id,
+                    idle_timeout,
+                    cancel,
+                    opts,
+                );
+                crate::stream::collect_response(events).await
+            }
         };
         let response = result
             .map(|(response, _metrics)| response)
@@ -2531,6 +2578,7 @@ mod tests {
                 ("application/json", EMPTY_CHAT_COMPLETION_JSON)
             }
             (false, ApiBackend::Messages) => ("application/json", EMPTY_MESSAGE_JSON),
+            (false, ApiBackend::CursorCli) => unreachable!("Cursor CLI sends no HTTP request"),
         };
         let (tx, rx) = oneshot::channel();
         let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
@@ -2585,6 +2633,7 @@ mod tests {
             (true, ApiBackend::Messages) => {
                 client.conversation_stream_messages(request).await.map(drop)
             }
+            (_, ApiBackend::CursorCli) => unreachable!("Cursor CLI sends no HTTP request"),
         };
         sent.unwrap_or_else(|e| panic!("{backend:?} streaming={streaming}: {e}"));
         let captured = rx.await.unwrap();

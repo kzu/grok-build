@@ -125,11 +125,70 @@ fn is_live_critical(
 /// Promo twin of [`is_live_critical`].
 /// A CTA is NOT required: a promo without one is still a valid 1-line message row.
 /// (The selection already guarantees a visible message, so it skips items with nothing to render.)
+/// When the active route is Cursor-billed (or an explicit paywall override), SuperGrok upgrade promos (and their `[Upgrade Account]` CTAs) are suppressed.
 fn is_live_promo(
     a: &xai_grok_announcements::RemoteAnnouncement,
     now: chrono::DateTime<chrono::Utc>,
 ) -> bool {
-    is_promo(a) && !xai_grok_announcements::is_expired_at(a, now)
+    is_promo(a) && !xai_grok_announcements::is_expired_at(a, now) && !upgrade_upsells_suppressed()
+}
+
+/// Process-wide active model for paywall-sensitive announcement paint.
+///
+/// Updated from the pager whenever the selected model changes (and before
+/// welcome/session paint). Keeps announcement helpers free of an extra
+/// `active_model_id` argument while still gating on Cursor-billed routes.
+fn paywall_active_model() -> Option<String> {
+    #[cfg(test)]
+    {
+        PAYWALL_ACTIVE_MODEL.with(|m| m.borrow().clone())
+    }
+    #[cfg(not(test))]
+    {
+        PAYWALL_ACTIVE_MODEL.lock().ok().and_then(|g| g.clone())
+    }
+}
+
+#[cfg(not(test))]
+static PAYWALL_ACTIVE_MODEL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+thread_local! {
+    /// Per-thread so a test that publishes a `cursor/…` model cannot hide
+    /// promos in parallel tests.
+    static PAYWALL_ACTIVE_MODEL: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Publish the model id used for SuperGrok upsell suppression in announcements.
+pub fn set_paywall_active_model(model_id: Option<&str>) {
+    #[cfg(test)]
+    PAYWALL_ACTIVE_MODEL.with(|m| *m.borrow_mut() = model_id.map(str::to_owned));
+    #[cfg(not(test))]
+    if let Ok(mut slot) = PAYWALL_ACTIVE_MODEL.lock() {
+        *slot = model_id.map(str::to_owned);
+    }
+}
+
+/// Whether SuperGrok upgrade promo CTAs / promo slot should be hidden.
+///
+/// True when the published active model is Cursor-billed, or the user set an
+/// explicit `GROK_CURSOR_CLI=1` / `[features].cursor_cli = true` override.
+/// Installing `agent` alone does not suppress upsells on xAI free-tier models.
+///
+/// Unit tests: only a published `cursor/…` model suppresses, so PATH
+/// auto-detect and the on-disk override cannot flake tests.
+pub(crate) fn upgrade_upsells_suppressed() -> bool {
+    let active = paywall_active_model();
+    let active_ref = active.as_deref();
+    #[cfg(test)]
+    {
+        active_ref.is_some_and(xai_grok_shell::agent::cursor_cli::is_cursor_billed_model)
+    }
+    #[cfg(not(test))]
+    {
+        xai_grok_shell::agent::cursor_cli::suppress_supergrok_paywalls(active_ref)
+    }
 }
 
 /// The session-surfaced severities (critical or promo).
@@ -273,6 +332,11 @@ pub(crate) fn promo_cta<'a>(
     &'a str,
     &'a str,
 )> {
+    // Cursor-billed active route (or explicit override) — hide SuperGrok
+    // upgrade CTAs (header / welcome / dashboard `[Upgrade Account]` buttons).
+    if upgrade_upsells_suppressed() {
+        return None;
+    }
     let owner = first_session_announcement(announcements, hidden_ids).filter(|a| is_promo(a))?;
     let (label, url) = usable_cta(owner)?;
     Some((owner, label, url))
@@ -1275,6 +1339,35 @@ mod tests {
         );
 
         assert!(promo_cta(&[promo("n", "msg", None)], &no_hidden()).is_none());
+    }
+
+    /// Cursor CLI billing suppresses SuperGrok upgrade promo CTAs (and the
+    /// promo session slot) so `[Upgrade Account]` cannot surface.
+    #[test]
+    fn cursor_cli_suppresses_upgrade_promo_cta() {
+        set_paywall_active_model(Some("cursor/auto"));
+        let pinned = {
+            let mut a = promo(
+                "p",
+                "Upgrade now",
+                Some(("Upgrade Account", "https://x.ai/promo")),
+            );
+            a.dismissible = Some(false);
+            [a]
+        };
+        assert!(
+            upgrade_upsells_suppressed(),
+            "a Cursor-billed model must suppress upgrade upsells"
+        );
+        assert!(
+            promo_cta(&pinned, &no_hidden()).is_none(),
+            "promo CTA must be hidden when Cursor can bill"
+        );
+        assert!(
+            first_session_announcement(&pinned, &no_hidden()).is_none(),
+            "promo must leave the session announcement slot"
+        );
+        set_paywall_active_model(None);
     }
 
     /// The shared CTA-button painter (used by all four surfaces) clamps the button to `max_width` and returns the clickable button rect.

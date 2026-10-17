@@ -336,7 +336,7 @@ pub(super) fn dispatch_show_context_info(app: &mut AppView) -> Vec<Effect> {
 }
 
 /// `/usage`: open the usage modal on its "Usage limit" tab.
-/// Minimal mode keeps the scrollback flow: session token/cost, then consumer credits.
+/// Minimal mode keeps the scrollback flow: session token/cost, then Cursor account, then consumer credits.
 pub(super) fn dispatch_show_usage(app: &mut AppView) -> Vec<Effect> {
     if !app.screen_mode.is_minimal() {
         return open_usage_info_modal(app, crate::views::usage_modal::UsageInfoTab::UsageLimit);
@@ -365,7 +365,7 @@ pub(super) fn dispatch_show_usage(app: &mut AppView) -> Vec<Effect> {
                     ),
                 );
             }
-            append_consumer_billing_surface(app, id)
+            append_cursor_usage_surface(id)
         }
     }
 }
@@ -395,7 +395,7 @@ pub(super) fn handle_session_usage_result(
     commit_session_usage_block(app, agent_id, session_id, text)
 }
 
-/// Commit a session-usage block if still on `session_id`, then consumer credits.
+/// Commit a session-usage block if still on `session_id`, then the Cursor account and consumer credits.
 pub(super) fn commit_session_usage_block(
     app: &mut AppView,
     agent_id: AgentId,
@@ -409,6 +409,25 @@ pub(super) fn commit_session_usage_block(
         return vec![];
     }
     push_and_page_flip(&mut agent.scrollback, RenderBlock::system(text));
+    append_cursor_usage_surface(agent_id)
+}
+
+/// Next `/usage` step after the session ledger: Cursor account, then SuperGrok.
+pub(super) fn append_cursor_usage_surface(agent_id: AgentId) -> Vec<Effect> {
+    vec![Effect::FetchCursorUsage { agent_id }]
+}
+
+/// Commit the Cursor account block (or a failure note), then consumer credits.
+pub(super) fn commit_cursor_usage_block(
+    app: &mut AppView,
+    agent_id: AgentId,
+    text: Option<String>,
+) -> Vec<Effect> {
+    if let Some(text) = text
+        && let Some(agent) = app.agents.get_mut(&agent_id)
+    {
+        push_and_page_flip(&mut agent.scrollback, RenderBlock::system(text));
+    }
     append_consumer_billing_surface(app, agent_id)
 }
 
