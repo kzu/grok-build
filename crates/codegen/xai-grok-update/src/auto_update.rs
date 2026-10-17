@@ -533,6 +533,9 @@ pub async fn get_installer() -> Option<&'static str> {
     match cfg.cli.installer.as_deref() {
         Some("npm") => Some("npm"),
         Some("gh-release") => Some("gh-release"),
+        // Fork releases installed by scripts/install.sh set this so the binary
+        // stays on the GitHub build instead of being replaced from the public CDN.
+        Some("github") => None,
         Some(_) => Some("internal"),
         // A wiped config must not reclassify an npm install as internal:
         // that re-enables downgrades and updates npm never sees.
